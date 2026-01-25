@@ -1,0 +1,17 @@
+telethon
+pydantic
+python-dotenv
+requests
+python-dateutil
+
+# LLM Curation
+typer
+rich
+Pillow
+langchain-groq
+langchain-core
+
+# Development & Testing
+pytest
+pytest-asyncio
+pytest-mock

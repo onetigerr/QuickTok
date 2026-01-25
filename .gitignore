@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+
+# Virtual Environment
+/venv/
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Project specific
+/data/
+.pytest_cache/
+coverage.xml
+htmlcov/
