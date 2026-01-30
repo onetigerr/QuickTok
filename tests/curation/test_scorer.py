@@ -11,7 +11,8 @@ def mock_llm_response():
         "engagement": 7,
         "tiktok_fit": 9,
         "is_explicit": False,
-        "reasoning": "Great lighting and pose."
+        "reasoning": "Great lighting and pose.",
+        "watermark_offset_pct": 88.0
     }
 
 @pytest.fixture
@@ -23,14 +24,16 @@ def mock_batch_response():
                 "engagement": 8,
                 "tiktok_fit": 8,
                 "is_explicit": False,
-                "reasoning": "Img 1 good"
+                "reasoning": "Img 1 good",
+                "watermark_offset_pct": 92.5
             },
             {
                 "wow_factor": 2,
                 "engagement": 2,
                 "tiktok_fit": 2,
                 "is_explicit": False,
-                "reasoning": "Img 2 bad"
+                "reasoning": "Img 2 bad",
+                "watermark_offset_pct": None
             }
         ]
     }
@@ -109,17 +112,34 @@ async def test_score_batch_success(scorer, mock_batch_response, tmp_path):
         assert results[1].wow_factor == 2
 
 @pytest.mark.asyncio
-async def test_score_batch_mismatch(scorer, mock_batch_response, tmp_path):
+async def test_score_batch_mismatch(scorer, mock_batch_response, mock_llm_response, tmp_path):
     """Test when API returns fewer/more scores than images."""
-    mock_msg = MagicMock()
     import json
-    mock_msg.content = json.dumps(mock_batch_response) # Returns 2 scores
-    scorer.llm.ainvoke = AsyncMock(return_value=mock_msg)
     
     # Send 3 paths
     paths = [tmp_path / "1.jpg", tmp_path / "2.jpg", tmp_path / "3.jpg"]
     for p in paths: p.touch()
     
+    # First call returns batch response with only 2 scores (mismatch)
+    # Subsequent calls (fallback to sequential) return individual scores
+    call_count = 0
+    def mock_ainvoke_side_effect(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        mock_msg = MagicMock()
+        if call_count == 1:
+            # First call: batch request returns 2 scores for 3 images (mismatch)
+            mock_msg.content = json.dumps(mock_batch_response)
+        else:
+            # Subsequent calls: individual scoring during fallback
+            mock_msg.content = json.dumps(mock_llm_response)
+        return mock_msg
+    
+    scorer.llm.ainvoke = AsyncMock(side_effect=mock_ainvoke_side_effect)
+    
     with patch("src.curation.scorer.ThumbnailGenerator.to_base64", return_value="base64str"):
-        with pytest.raises(RuntimeError, match="Batch scoring failed"):
-            await scorer.score_batch(paths)
+        # Should successfully fall back to sequential scoring
+        results = await scorer.score_batch(paths)
+        assert len(results) == 3
+        # All should have the same score from mock_llm_response
+        assert all(r.wow_factor == 8 for r in results)

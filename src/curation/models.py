@@ -11,13 +11,19 @@ class ImageScore(BaseModel):
     tiktok_fit: int = Field(ge=0, le=10, description="Suitability for platform (1-10)")
     is_explicit: bool = Field(description="True if NSFW/banned content")
     reasoning: str = Field(description="Brief explanation of the score")
+    watermark_offset_pct: Optional[float] = Field(
+        default=None, 
+        ge=0.0, 
+        le=100.0, 
+        description="Vertical offset of watermark from top (0-100%), null if none"
+    )
     
     @property
     def combined_score(self) -> float:
         """Calculates average score, returns 0.0 if explicit."""
         if self.is_explicit:
             return 0.0
-        return (self.wow_factor + self.engagement + self.tiktok_fit) / 3.0
+        return round((self.wow_factor + self.engagement + self.tiktok_fit) / 3.0, 1)
 
 class CurationConfig(BaseModel):
     """Pipeline configuration."""
@@ -26,6 +32,7 @@ class CurationConfig(BaseModel):
     jpeg_quality: int = 60
     batch_size: int = 5
     dry_run: bool = False
+    force: bool = False  # Force re-curation even if already processed
 
 @dataclass
 class CurationResult:

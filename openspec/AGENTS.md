@@ -3,8 +3,10 @@
 ## Communication & Coding Rules
 - **Language**: All communication with the user must be in **Russian**.
 - **Tone**: Always use formal address (**Вы**) when communicating with the user.
+- **Artifacts**: All internal documentation, OpenSpec artifacts (proposal.md, tasks.md, design.md, spec.md), and system-level documents MUST be in **English**.
 - **Coding**: All code, comments, and strings within the code must be in **English**.
 - **Formatting**: Questions to the user should be presented as a **flat numbered list**.
+- **Conflict Resolution**: If a user's instruction appears to conflict with established specifications (`specs/`), project conventions (`project.md`), or active changes (`changes/`), the agent **MUST** explicitly notify the user of the discrepancy. The agent shall present the conflicting points clearly and wait for user confirmation or clarification before proceeding. This ensures that both accidental user errors and outdated documentation are addressed through deliberate choice.
 
 Instructions for AI coding assistants using OpenSpec for spec-driven development.
 
@@ -459,4 +461,4 @@ openspec validate --strict # Is it correct?
 openspec archive <change-id> [--yes|-y]  # Mark complete (add --yes for automation)
 ```
 
-Remember: Specs are truth. Changes are proposals. Keep them in sync.
+Remember: Specs are the recorded truth, but the User's intent is the final authority. If they diverge, STOP, NOTIFY, and DISCUSS. Never assume one is correct over the other without explicit confirmation.

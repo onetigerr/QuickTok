@@ -3,7 +3,7 @@ from telethon.tl.types import Message
 from ..models import NormalizedMetadata, ContentFormat
 from .base import BaseAdapter
 
-# Regex для удаления emoji
+# Regex for stripping emojis
 EMOJI_PATTERN = re.compile(
     "["
     "\U0001F600-\U0001F64F"  # emoticons
@@ -23,7 +23,7 @@ class CCumpotAdapter(BaseAdapter):
         return "CCumpot"
     
     def filter(self, message: Message) -> bool:
-        # Фильтрация отключена — принимаем все посты с медиа
+        # Filtering disabled — accepting all posts with media
         return message.media is not None
     
     def extract_metadata(self, message: Message) -> NormalizedMetadata:
@@ -38,11 +38,11 @@ class CCumpotAdapter(BaseAdapter):
         )
     
     def _strip_emoji(self, text: str) -> str:
-        """Удаляет все emoji из строки."""
+        """Removes all emojis from a string."""
         return EMOJI_PATTERN.sub('', text).strip()
     
     def _parse_model_name(self, text: str) -> str:
-        """Извлекает имя модели из второй строки, очищая от emoji."""
+        """Extracts model name from the second line, stripping emojis."""
         lines = text.strip().split('\n')
         if len(lines) < 2:
             return "Unknown"
@@ -50,7 +50,7 @@ class CCumpotAdapter(BaseAdapter):
         return second_line if second_line else "Unknown"
     
     def _parse_set_name(self, text: str) -> str | None:
-        """Извлекает название сета из третьей строки, очищая от emoji."""
+        """Extracts set name from the third line, stripping emojis."""
         lines = text.strip().split('\n')
         if len(lines) < 3:
             return None

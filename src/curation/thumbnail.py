@@ -23,6 +23,7 @@ class ThumbnailGenerator:
         - Compresses to specified quality
         - Returns bytes
         """
+        img_copy = None
         try:
             with Image.open(image_path) as img:
                 # Convert to RGB if needed (handles RGBA, P, etc. for JPEG)
@@ -33,23 +34,28 @@ class ThumbnailGenerator:
                 # (though here we just save to bytes)
                 img_copy = img.copy()
                 
-                # Resize if larger than max_size
-                img_copy.thumbnail(self.max_size, Image.Resampling.LANCZOS)
-                
-                # Compress to bytes
-                buffer = io.BytesIO()
-                img_copy.save(
-                    buffer, 
-                    format=self.format, 
-                    quality=self.quality, 
-                    optimize=True
-                )
-                return buffer.getvalue()
+            # Process outside the with block to ensure original is closed
+            # Resize if larger than max_size
+            img_copy.thumbnail(self.max_size, Image.Resampling.LANCZOS)
+            
+            # Compress to bytes
+            buffer = io.BytesIO()
+            img_copy.save(
+                buffer, 
+                format=self.format, 
+                quality=self.quality, 
+                optimize=True
+            )
+            return buffer.getvalue()
         except OSError as e:
             # Re-raise with context if file issues
             raise OSError(f"Failed to process image {image_path}: {e}")
         except Exception as e:
             raise RuntimeError(f"Thumbnail generation failed for {image_path}: {e}")
+        finally:
+            # Explicitly close the copy to release resources
+            if img_copy is not None:
+                img_copy.close()
 
     def to_base64(self, image_path: Path) -> str:
         """Returns base64-encoded string for API usage."""
@@ -62,5 +68,10 @@ class ThumbnailGenerator:
         Approximation: (width * height) / 750 for standard vision models.
         """
         thumbnail_bytes = self.generate(image_path)
-        with Image.open(io.BytesIO(thumbnail_bytes)) as img:
-            return int((img.width * img.height) / 750)
+        buffer = io.BytesIO(thumbnail_bytes)
+        try:
+            with Image.open(buffer) as img:
+                return int((img.width * img.height) / 750)
+        finally:
+            buffer.close()
+

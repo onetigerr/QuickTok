@@ -6,21 +6,21 @@ class BaseAdapter(ABC):
     @property
     @abstractmethod
     def channel_name(self) -> str:
-        """Имя канала, который обрабатывает этот адаптер."""
+        """Name of the channel this adapter processes."""
         pass
     
     @abstractmethod
     def filter(self, message: Message) -> bool:
         """
-        Возвращает True, если пост нужно скачивать.
-        Используется для фильтрации рекламы, служебных постов и т.д.
+        Returns True if the post should be downloaded.
+        Used for filtering ads, service posts, etc.
         """
         pass
     
     @abstractmethod
     def extract_metadata(self, message: Message) -> NormalizedMetadata:
         """
-        Извлекает структурированные метаданные из сообщения.
-        Возвращает NormalizedMetadata с model_name, set_name и т.д.
+        Extracts structured metadata from the message.
+        Returns NormalizedMetadata with model_name, set_name, etc.
         """
         pass

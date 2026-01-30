@@ -1,4 +1,6 @@
+import warnings
 import typer
+
 import asyncio
 from pathlib import Path
 from rich import print
@@ -13,8 +15,23 @@ from dotenv import load_dotenv
 # Load env variables including GROQ_API_KEY
 load_dotenv()
 
-app = typer.Typer(help="LLM-based Image Curation CLI")
+# Allow flags to be specified anywhere (before or after arguments)
+CONTEXT_SETTINGS = {"allow_interspersed_args": True}
+app = typer.Typer(help="LLM-based Image Curation CLI", context_settings=CONTEXT_SETTINGS)
 console = Console()
+
+# Global state for force flag
+class GlobalState:
+    force: bool = False
+
+global_state = GlobalState()
+
+@app.callback()
+def main_callback(
+    force: bool = typer.Option(False, "--force", "-f", help="Force re-curation even if already processed")
+):
+    """Global options for all commands."""
+    global_state.force = force
 
 @app.command()
 def curate(
@@ -31,7 +48,8 @@ def curate(
     config = CurationConfig(
         threshold=threshold,
         dry_run=dry_run,
-        batch_size=batch_size
+        batch_size=batch_size,
+        force=global_state.force
     )
     
     # Initialize pipeline
@@ -41,9 +59,10 @@ def curate(
         
         scorer = ImageScorer(api_key=api_key)
         
-        # Initialize DB
+        # Initialize DB (will auto-create if doesn't exist)
         db_path = Path("data/telegram_imports.db")
-        db = TelegramImportDB(db_path) if db_path.exists() else None
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        db = TelegramImportDB(db_path)
         
         pipeline = CurationPipeline(config=config, scorer=scorer, db=db)
     except Exception as e:
@@ -69,46 +88,79 @@ def curate_all(
     """
     Process all subfolders in data/incoming recursively.
     """
-    # Find all leaf directories that contain images?
-    # Or just iterate over channel folders.
-    # Structure: data/incoming/Channel/Timestamp/
-    # We should iterate over Timestamp folders.
-    
-    # Simplification: walk and find dirs with images?
-    # Or just iterate incoming/*/*
-    
-    # For MVP, let's assume standard structure: incoming/Channel/Timestamp
     if not incoming_dir.exists():
         console.print(f"[red]Directory not found: {incoming_dir}[/red]")
         raise typer.Exit(1)
 
-    channels = [d for d in incoming_dir.iterdir() if d.is_dir()]
-    total_processed = 0
-    
-    for channel in channels:
-        timestamps = [d for d in channel.iterdir() if d.is_dir()]
-        for ts_folder in timestamps:
-            console.print(f"\n[bold]Processing:[/bold] {ts_folder}")
-            # Call curate logic (reuse or subprocess?)
-            # Reuse logic
-            config = CurationConfig(threshold=threshold, dry_run=dry_run, batch_size=batch_size)
-            try:
-                from src.curation.scorer import ImageScorer
-                from src.telegram.database import TelegramImportDB
+    # Initialize shared resources once
+    try:
+        from src.curation.scorer import ImageScorer
+        from src.telegram.database import TelegramImportDB
+    except ImportError as e:
+        console.print(f"[red]Failed to import dependencies: {e}[/red]")
+        raise typer.Exit(1)
 
-                scorer = ImageScorer() # Env var expected
-                
-                db_path = Path("data/telegram_imports.db")
-                db = TelegramImportDB(db_path) if db_path.exists() else None
+    async def _curate_all_async():
+        # Initialize dependencies inside the loop to ensure clean async context
+        # Although ImageScorer might be robust, it's safer to init here.
+        config = CurationConfig(threshold=threshold, dry_run=dry_run, batch_size=batch_size, force=global_state.force)
+        
+        try:
+            scorer = ImageScorer() # Env var expected
+        except Exception as e:
+            console.print(f"[red]Failed to initialize Scorer:[/red] {e}")
+            return 0
+
+        db_path = Path("data/telegram_imports.db")
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        db = TelegramImportDB(db_path)
+        
+        # We can reuse the same pipeline instance as well, or create new ones.
+        # Reusing is better if it doesn't hold state per folder. 
+        # CurationPipeline seems stateless regarding folder (passed in method).
+        # It holds 'consecutive_errors' state which is desirable to circuit-break globally?
+        # Or per folder?
+        # The user probably wants per-run circuit breaker, or at least per-folder reset?
+        # The original code re-initialized pipeline per folder, so consecutive_errors reset per folder?
+        # Let's check pipeline.py.
+        # Pipeline.__init__: consecutive_errors = 0.
+        # So it resets per folder in old code.
+        # If we reuse pipeline, consecutive_errors accumulates.
+        # If we want to mimic old behavior (reset error count per folder), we should manually reset or re-init.
+        # Re-initializing Pipeline is cheap (just object creation).
+        
+        # Actually pipeline.curate_folder resets consecutive_errors on success.
+        # But if a folder fails completely, we might want to continue to next?
+        # If we share pipeline, and one folder triggers 3 errors, pipeline stops everything?
+        # Pipeline.curate_folder loop breaks on consecutive_errors.
+        # But afterwards, consecutive_errors is still high.
+        # So we should probably re-create pipeline or reset it.
+        # Let's re-create pipeline per folder to be safe and isolated, 
+        # BUT REUSE SCORER. The Scorer is the heavy resource.
+        
+        channels = [d for d in incoming_dir.iterdir() if d.is_dir()]
+        total_processed_count = 0
+        
+        for channel in channels:
+            timestamps = [d for d in channel.iterdir() if d.is_dir()]
+            for ts_folder in timestamps:
+                console.print(f"\n[bold]Processing:[/bold] {ts_folder}")
                 
                 pipeline = CurationPipeline(config=config, scorer=scorer, db=db)
                 
-                report = asyncio.run(pipeline.curate_folder(ts_folder))
-                _print_report(report)
-                total_processed += report.total_images
-            except Exception as e:
-                console.print(f"[red]Failed to process {ts_folder}: {e}[/red]")
+                try:
+                    report = await pipeline.curate_folder(ts_folder)
+                    _print_report(report)
+                    total_processed_count += report.total_images
+                except Exception as e:
+                    console.print(f"[red]Failed to process {ts_folder}: {e}[/red]")
+                    # Continue to next folder
+        
+        return total_processed_count
 
+    # Run the single async entry point
+    total_processed = asyncio.run(_curate_all_async())
+    
     console.print(f"\n[bold green]Finished processing all folders. Total images: {total_processed}[/bold green]")
 
 def _print_report(report: CurationReport):

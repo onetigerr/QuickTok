@@ -19,14 +19,14 @@ class TelegramClientWrapper:
         # We assume api_id/hash are embedded in the session or not needed if we are just using the session file
         # But Telethon usually requires them. 
         # For this design, we'll assume they are loaded from env vars by the caller or passed in.
-        # But wait, the design says "Use session-файла". 
+        # The design specifies using a session file.
         # Telethon still needs api_id/hash even with session file usually, unless it's a string session?
         # The design shows `__init__(self, session_path: Path, api_id: int, api_hash: str)`
         # I will update the init to match the design.
         self.client = None
 
     async def connect(self, api_id: int, api_hash: str):
-        """Подключение к Telegram."""
+        """Connect to Telegram."""
         self.client = TelegramClient(str(self.session_path), api_id, api_hash)
         await self.client.connect()
         if not await self.client.is_user_authorized():
@@ -39,9 +39,7 @@ class TelegramClientWrapper:
         limit: int | None = None,
         incoming_dir: Path = Path("data/incoming")
     ) -> ImportResult:
-        """
-        Основной метод импорта.
-        """
+        """Main import method."""
         if not self.client:
             raise RuntimeError("Client not connected")
 
@@ -135,7 +133,7 @@ class TelegramClientWrapper:
         return result
 
     async def download_media_with_comments(self, message: Message, dest_folder: Path, channel_entity) -> list[Path]:
-        """Скачивает все медиа из сообщения и его комментариев в указанную папку."""
+        """Downloads all media from the message and its comments into the specified folder."""
         from .settings import MAX_FILE_SIZE_BYTES
         
         paths = []

@@ -91,6 +91,13 @@ class ImageScorer:
             return results
             
         except Exception as e:
-            # Fallback strategy: if batch fails, try sequential?
-            # For now, just raise
-            raise RuntimeError(f"Batch scoring failed: {e}")
+            # Fallback to sequential scoring if batch fails
+            # This handles cases where the LLM produces invalid JSON for the batch
+            # or misses fields for specific items in the list.
+            print(f"Batch scoring failed ({e}), falling back to sequential...")
+            results = []
+            for path in image_paths:
+                # If a single image fails in sequential mode, it will raise and stop the process.
+                # This preserves the original behavior of ensuring all images are scored or failing.
+                results.append(await self.score(path))
+            return results

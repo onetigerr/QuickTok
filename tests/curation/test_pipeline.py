@@ -20,9 +20,10 @@ def sample_folder(tmp_path):
     return folder
 
 @pytest.mark.asyncio
-async def test_find_images(sample_folder):
+async def test_find_images(sample_folder, tmp_path):
     # Mock scorer to avoid API key check
     pipeline = CurationPipeline(scorer=AsyncMock())
+    pipeline.curated_base_dir = tmp_path / "curated" # Ensure no local pollution
     images = pipeline._find_images(sample_folder)
     assert len(images) == 2
     assert all(i.suffix == ".jpg" for i in images)
@@ -98,12 +99,13 @@ async def test_curation_folder_structure(mock_scorer, tmp_path):
     pass
 
 @pytest.mark.asyncio
-async def test_circuit_breaker(sample_folder, mock_scorer):
+async def test_circuit_breaker(sample_folder, mock_scorer, tmp_path):
     # Mock scorer to fail
     mock_scorer.score_batch.side_effect = RuntimeError("API Error")
     
     config = CurationConfig(batch_size=1) 
     pipeline = CurationPipeline(config=config, scorer=mock_scorer)
+    pipeline.curated_base_dir = tmp_path / "curated"
     
     (sample_folder / "img3.jpg").touch() 
     (sample_folder / "img4.jpg").touch()
@@ -115,7 +117,7 @@ async def test_circuit_breaker(sample_folder, mock_scorer):
     assert mock_scorer.score_batch.call_count == 3
 
 @pytest.mark.asyncio
-async def test_batching(sample_folder, mock_scorer):
+async def test_batching(sample_folder, mock_scorer, tmp_path):
     # 5 images
     for i in range(5):
         (sample_folder / f"extra{i}.jpg").touch()
@@ -129,6 +131,7 @@ async def test_batching(sample_folder, mock_scorer):
     
     config = CurationConfig(batch_size=5)
     pipeline = CurationPipeline(config=config, scorer=mock_scorer)
+    pipeline.curated_base_dir = tmp_path / "curated"
     
     await pipeline.curate_folder(sample_folder)
     

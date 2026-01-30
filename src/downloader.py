@@ -289,7 +289,7 @@ def main():
     
     json_path = args.json_path
     if not json_path:
-        search_dir = os.path.join(args.output, 'incoming.json')
+        search_dir = os.path.join(args.output, 'doyin.in')
         logger.info(f"No JSON path provided. Searching for newest JSON in '{search_dir}'...")
         json_path = downloader.find_latest_json(search_dir)
         if not json_path:

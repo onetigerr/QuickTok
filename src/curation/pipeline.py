@@ -2,6 +2,7 @@ from pathlib import Path
 from typing import List, Optional
 import shutil
 import asyncio
+import gc
 from datetime import datetime
 
 from src.curation.models import ImageScore, CurationConfig, CurationReport, CurationResult
@@ -29,60 +30,380 @@ class CurationPipeline:
     async def curate_folder(self, folder: Path) -> CurationReport:
         """Process all images in a folder."""
         start_time = datetime.now()
+        
+        # Optimization: Check if entire folder is already processed (unless force=True)
+        if self.db and not self.config.force:
+            try:
+                base_incoming = Path("data/incoming").resolve()
+                folder_abs = folder.resolve()
+                relative = folder_abs.relative_to(base_incoming)
+                db_key = str(relative)
+                
+                # Check DB flag
+                # User requested to ignore DB flag for now, relying only on filesystem
+                is_processed = False 
+                # is_processed = self.db.is_post_processed(db_key)
+                
+                # ALSO Check folder existence in curated/
+                model_name = self.db.get_model_by_path(db_key)
+                if model_name:
+                    dest_folder = self.curated_base_dir / model_name / folder.name
+                    if dest_folder.exists():
+                        is_processed = True
+
+                if is_processed:
+                    print(f"Skipping processed folder: {folder.name}")
+                    return self._create_skipped_report(folder, start_time, "Folder already processed")
+            except Exception:
+                pass
+
         image_files = self._find_images(folder)
         
-        results: List[CurationResult] = []
+        # Step 1: Score all images in batches
+        all_scores = []
+        paths_to_score = []
+        skipped_results = []
         
-        # Process in batches
-        for i in range(0, len(image_files), self.config.batch_size):
+        for path in image_files:
+            # Check if already processed (unless force=True)
+            is_processed = False
+            if not self.config.force:
+                dest_predict = self._move_to_curated(path, dry_run=True)
+                if dest_predict.exists():
+                    is_processed = True
+
+            if is_processed:
+                skipped_results.append(CurationResult(
+                    source_path=path,
+                    curated=False,
+                    error="Already processed"
+                ))
+            else:
+                paths_to_score.append(path)
+        
+        # Score in batches to avoid overwhelming the API
+        for i in range(0, len(paths_to_score), self.config.batch_size):
             if self.consecutive_errors >= self.max_consecutive_errors:
                 print("Circuit breaker triggered. Stopping curation.")
                 break
                 
-            batch_paths = image_files[i : i + self.config.batch_size]
-            batch_results = await self._process_batch(batch_paths)
-            results.extend(batch_results)
+            batch_paths = paths_to_score[i : i + self.config.batch_size]
+            try:
+                batch_scores = await self.scorer.score_batch(batch_paths)
+                all_scores.extend(batch_scores)
+                self.consecutive_errors = 0
+                
+                # Save scores to database (skip explicit photos)
+                if self.db:
+                    for path, score in zip(batch_paths, batch_scores):
+                        try:
+                            # Resolve model name from DB
+                            base_incoming = Path("data/incoming").resolve()
+                            relative = path.resolve().relative_to(base_incoming)
+                            db_key = str(relative.parent)
+                            model_name = self.db.get_model_by_path(db_key)
+                            
+                            # Convert ImageScore to dict
+                            score_dict = {
+                                'wow_factor': score.wow_factor,
+                                'engagement': score.engagement,
+                                'tiktok_fit': score.tiktok_fit,
+                                'is_explicit': score.is_explicit,
+                                'reasoning': score.reasoning,
+                                'watermark_offset_pct': score.watermark_offset_pct
+                            }
+                            
+                            # Use relative path as file_path identifier
+                            result = self.db.save_photo_score(str(relative), score_dict, model_name)
+                            if result is None and not score.is_explicit:
+                                print(f"DEBUG: Failed to save score for {relative} (not explicit, but returned None - duplicate?)")
+                            elif result is not None:
+                                print(f"DEBUG: Saved score for {relative} with id={result}")
+                            elif score.is_explicit:
+                                print(f"DEBUG: Skipped explicit photo {relative}")
+                        except Exception as e:
+                            # Don't fail the pipeline if DB save fails, but log it
+                            print(f"ERROR saving score to DB for {path}: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            
+            except Exception as e:
+                self.consecutive_errors += 1
+                # Add error results for failed batch
+                for path in batch_paths:
+                    skipped_results.append(CurationResult(
+                        source_path=path,
+                        curated=False,
+                        error=str(e)
+                    ))
             
+            # Force garbage collection
+            gc.collect()
+        
+        # Step 2: Apply selection logic to ALL scored images (folder-level)
+        path_score_pairs = list(zip(paths_to_score[:len(all_scores)], all_scores))
+        
+        # Separate explicit and non-explicit
+        non_explicit = [(p, s) for p, s in path_score_pairs if not s.is_explicit]
+        explicit = [(p, s) for p, s in path_score_pairs if s.is_explicit]
+        
+        # Sort non-explicit by combined_score (descending)
+        non_explicit.sort(key=lambda x: x[1].combined_score, reverse=True)
+        
+        # Separate above and below threshold
+        above_threshold = [(p, s) for p, s in non_explicit if s.combined_score >= self.config.threshold]
+        below_threshold = [(p, s) for p, s in non_explicit if s.combined_score < self.config.threshold]
+        
+        # Select: ALL above threshold if >= 6, otherwise fill up to 6 with below threshold
+        if len(above_threshold) >= 6:
+            selected = above_threshold
+        else:
+            selected = above_threshold.copy()
+            remaining = 6 - len(selected)
+            selected.extend(below_threshold[:remaining])
+        
+        # Step 3: Move selected files and create results
+        results = []
+        
+        for path, score in selected:
+            dest = None
+            if not self.config.dry_run:
+                dest = self._move_to_curated(path)
+            else:
+                dest = self._move_to_curated(path, dry_run=True)
+            
+            results.append(CurationResult(
+                source_path=path,
+                score=score,
+                curated=True,
+                destination=dest
+            ))
+        
+        # Add rejected photos
+        rejected = explicit + [pair for pair in non_explicit if pair not in selected]
+        for path, score in rejected:
+            results.append(CurationResult(
+                source_path=path,
+                score=score,
+                curated=False,
+                destination=None
+            ))
+        
+        # Mark folder as processed in DB
+        if not self.config.dry_run and self.db and paths_to_score:
+            try:
+                relative = paths_to_score[0].relative_to(Path("data/incoming"))
+                db_key = str(relative.parent)
+                self.db.mark_post_processed(db_key)
+            except:
+                pass
+        
+        # Combine with skipped results
+        all_results = skipped_results + results
+        
         # Aggregate report
-        return self._create_report(folder, results, start_time)
+        return self._create_report(folder, all_results, start_time)
 
     async def _process_batch(self, paths: List[Path]) -> List[CurationResult]:
         """Process a batch of images."""
         batch_results = []
         try:
-            scores = await self.scorer.score_batch(paths)
+            # Filter out already curated items
+            paths_to_score = []
+            skipped_results = []
+            
+            for path in paths:
+                # 1. Check if already exists in curated (rough check based on expected destination)
+                # This is tricky because destination depends on model name resolution which happens later.
+                # But we can check DB first.
+                
+                is_processed = False
+                if self.db and not self.config.force:
+                    # Resolve relative path for DB lookup
+                    try:
+                        relative = path.relative_to(Path("data/incoming"))
+                        # DB store file_path as "Channel/Date/file.jpg" usually?
+                        # Let's check DB schema or usage. 
+                        # In imports we save "Channel/Date/file.jpg"?
+                        # Let's assume relative path matches DB file_path column.
+                        # Actually ImportedPost.file_path usually stores relative path.
+                        
+                        # Wait, pipeline uses relative_to("data/incoming").
+                        # Let's verify what's stored in DB.
+                        # DB view earlier: "CCumpot/2026-01-23_15-40-26"
+                        # That looks like a folder path or ID?
+                        # Ah, the sample output: 1|CCumpot|...|CCumpot/2026-01-23_15-40-26|...
+                        # file_path column seems to be folder or file?
+                        # "CCumpot/2026-01-23_15-40-26" is likely the folder.
+                        # But individual photos? 
+                        # The importer saves *posts*. A post can have multiple photos.
+                        # If file_path is the folder, then `curation_processed` flag applies to the WHOLE post folder?
+                        # User said "But orient first on file existence".
+                        
+                        # If DB flag is per post (folder), then if we mark it processed, we skip all images in it.
+                        # That seems correct for "Processed this post".
+                        
+                        db_key = str(relative.parent) # The post folder
+                        # if self.db.is_post_processed(db_key):
+                        #    is_processed = True
+                    except ValueError:
+                        pass
+                
+                # 2. Check physical file existence in curated (unless force=True)
+                if not self.config.force:
+                    # We can predict destination and check existence
+                    # But move_to_curated logic is complex.
+                    # Let's rely on DB flag primarily for "processed status", 
+                    # and maybe check if destination file exists to be safe?
+                    # Calculating destination for every file before scoring is cheap.
+                    dest_predict = self._move_to_curated(path, dry_run=True)
+                    if dest_predict.exists():
+                         is_processed = True
+
+                if is_processed:
+                    skipped_results.append(CurationResult(
+                        source_path=path,
+                        curated=False,
+                        error="Already processed"
+                    ))
+                else:
+                    paths_to_score.append(path)
+
+            if not paths_to_score:
+                return skipped_results
+
+            scores = await self.scorer.score_batch(paths_to_score)
             self.consecutive_errors = 0  # Reset on success
             
-            for path, score in zip(paths, scores):
-                curated = self._should_curate(score)
+            # Save scores to database (skip explicit photos)
+            if self.db:
+                for path, score in zip(paths_to_score, scores):
+                    try:
+                        base_incoming = Path("data/incoming").resolve()
+                        relative = path.resolve().relative_to(base_incoming)
+                        db_key = str(relative.parent)
+                        model_name = self.db.get_model_by_path(db_key)
+                        
+                        score_dict = {
+                            'wow_factor': score.wow_factor,
+                            'engagement': score.engagement,
+                            'tiktok_fit': score.tiktok_fit,
+                            'is_explicit': score.is_explicit,
+                            'reasoning': score.reasoning,
+                            'watermark_offset_pct': score.watermark_offset_pct
+                        }
+                        
+                        result = self.db.save_photo_score(str(relative), score_dict, model_name)
+                        if result is None and not score.is_explicit:
+                            print(f"DEBUG: Failed to save score for {relative} (not explicit, but returned None - duplicate?)")
+                        elif result is not None:
+                            print(f"DEBUG: Saved score for {relative} with id={result}")
+                        elif score.is_explicit:
+                            print(f"DEBUG: Skipped explicit photo {relative}")
+                    except Exception as e:
+                        print(f"ERROR saving score to DB for {path}: {e}")
+                        import traceback
+                        traceback.print_exc()
+            
+            # New selection logic: select best non-explicit photos
+            # 1. Filter out explicit photos
+            # 2. Take ALL photos above threshold
+            # 3. If fewer than 6 above threshold, fill up to 6 with best below-threshold photos
+            
+            path_score_pairs = list(zip(paths_to_score, scores))
+            
+            # Separate explicit and non-explicit
+            non_explicit = [(p, s) for p, s in path_score_pairs if not s.is_explicit]
+            explicit = [(p, s) for p, s in path_score_pairs if s.is_explicit]
+            
+            # Sort non-explicit by combined_score (descending)
+            non_explicit.sort(key=lambda x: x[1].combined_score, reverse=True)
+            
+            # Separate above and below threshold
+            above_threshold = [(p, s) for p, s in non_explicit if s.combined_score >= self.config.threshold]
+            below_threshold = [(p, s) for p, s in non_explicit if s.combined_score < self.config.threshold]
+            
+            # Select: ALL above threshold if >= 6, otherwise fill up to 6 with below threshold
+            if len(above_threshold) >= 6:
+                # If we have 6+ above threshold, take only those
+                selected = above_threshold
+            else:
+                # If fewer than 6 above threshold, fill up to 6 with below threshold
+                selected = above_threshold.copy()
+                remaining = 6 - len(selected)
+                selected.extend(below_threshold[:remaining])
+            
+            # Create results for selected photos
+            scored_results = []
+            for path, score in selected:
+                curated = True
                 dest = None
                 
-                if curated:
-                    if not self.config.dry_run:
-                        dest = self._move_to_curated(path)
-                    else:
-                        # Calculate dest for reporting only
-                        dest = self._move_to_curated(path, dry_run=True)
+                if not self.config.dry_run:
+                    dest = self._move_to_curated(path)
+                else:
+                    # Calculate dest for reporting only
+                    dest = self._move_to_curated(path, dry_run=True)
                 
-                batch_results.append(CurationResult(
+                # Mark as processed in DB (if not dry run)
+                # We mark the *post* (folder) as processed? 
+                # Or do we need to track individual files?
+                # The DB migration added column to `imported_posts`.
+                # imported_posts is likely 1 row per post.
+                # So we mark the post (folder) as processed.
+                # Careful: batch might contain images from different posts?
+                # Batch comes from `image_files`. `_find_images` returns list.
+                # If we mix posts in a batch, we might mark a post processed when only 1 image of it is done.
+                # But usually we process folder by folder.
+                
+                if not self.config.dry_run and self.db:
+                   try:
+                       relative = path.relative_to(Path("data/incoming"))
+                       db_key = str(relative.parent)
+                       self.db.mark_post_processed(db_key)
+                   except:
+                       pass
+
+                scored_results.append(CurationResult(
                     source_path=path,
                     score=score,
                     curated=curated,
                     destination=dest
                 ))
+            
+            # Create results for rejected photos (explicit + not selected non-explicit)
+            rejected = explicit + [pair for pair in non_explicit if pair not in selected]
+            for path, score in rejected:
+                scored_results.append(CurationResult(
+                    source_path=path,
+                    score=score,
+                    curated=False,
+                    destination=None
+                ))
+            
+            return skipped_results + scored_results
                 
         except Exception as e:
-            # Entire batch failed
+            # Entire batch failed (only for actual scoring failures)
             self.consecutive_errors += 1
             error_msg = str(e)
-            for path in paths:
-                batch_results.append(CurationResult(
+            
+            # Skip skipped_results in error handling?
+            # If we had partial success (some skipped), we should return those?
+            # But e was raised likely during score_batch.
+            # If score_batch fails, we fail the *scored* items.
+            # Skipped items are already processed.
+            
+            # Fallback for paths_to_score
+            error_results = []
+            for path in paths_to_score:
+                error_results.append(CurationResult(
                     source_path=path,
                     error=error_msg,
                     curated=False
                 ))
-        
-        return batch_results
+            
+            return skipped_results + error_results
 
     def _should_curate(self, score: ImageScore) -> bool:
         """Check if image meets criteria."""
@@ -187,4 +508,18 @@ class CurationPipeline:
             errors=errors,
             avg_score=round(avg_score, 2),
             results=results
+        )
+
+    def _create_skipped_report(self, source: Path, start: datetime, reason: str) -> CurationReport:
+        """Create a report for a completely skipped folder."""
+        return CurationReport(
+            timestamp=start,
+            source_folder=str(source),
+            total_images=0,
+            curated_count=0,
+            rejected_explicit=0,
+            rejected_low_score=0,
+            errors=0, # Or count as 1 skipped? No, it's not an error.
+            avg_score=0.0,
+            results=[CurationResult(source_path=source, curated=False, error=reason)]
         )
